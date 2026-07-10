@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
-# Disable PyAutoGUI fail-safe pause to ensure ultra-smooth cursor panning
+# CRITICAL FIX FOR FPS & COOLDOWNS: Remove PyAutoGUI delays entirely
+pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
 
 # ==========================================
@@ -29,8 +30,9 @@ class HandTrackingEngine(QThread):
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
+            model_complexity=0,       # 0 = Ultra-fast processing mode
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6
         )
         
         # Settings controlled by the UI
@@ -38,17 +40,24 @@ class HandTrackingEngine(QThread):
         self.sensitivity = 1.5
         self.screen_width, self.screen_height = pyautogui.size()
 
-        # Smooth Tracking Variables (EMA Filter)
+        # Ultra-Smooth Tracking Filter Settings
         self.prev_x, self.prev_y = 0, 0
-        self.smoothing = 0.25  # Lower value = Smoother but slightly slower. Higher value = Faster but more jittery.
+        self.smoothing = 0.12  # Lowered from 0.20 to completely eliminate minor shaking
 
-        # Click State Variables to prevent accidental multiple clicks
-        self.is_clicking = False
-        self.click_threshold = 0.04  # Distance threshold between finger tips to register a pinch click
+        # Click State Locks
+        self.is_left_clicking = False
+        self.is_right_clicking = False
+        
+        # 2D Click Threshold (adjusted for screen-space scale normalization)
+        self.click_threshold = 0.04  
 
     def run(self):
-        # Using Camera Index 1 as discovered by your setup configuration
         cap = cv2.VideoCapture(1)
+        
+        # Camera Resolution Optimization
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
         prev_frame_time = 0
 
         while self._run_flag:
@@ -56,7 +65,6 @@ class HandTrackingEngine(QThread):
             if not ret:
                 continue
 
-            # Mirror the frame horizontally
             frame = cv2.flip(frame, 1)
             h, w, c = frame.shape
             
@@ -65,7 +73,7 @@ class HandTrackingEngine(QThread):
 
             hand_detected = False
 
-            # Calculate FPS
+            # Calculate actual loop execution FPS
             new_frame_time = time.time()
             fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
             prev_frame_time = new_frame_time
@@ -73,55 +81,62 @@ class HandTrackingEngine(QThread):
             if results.multi_hand_landmarks:
                 hand_detected = True
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw skeletal lines over your hand in the preview window
+                    # Draw skeletal overlay lines
                     self.mp_drawing.draw_landmarks(
                         frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                     )
                     
-                    # 1. CURSOR MOVEMENT LOGIC (Index Finger Tip is Landmark #8)
+                    # Extract raw structural landmarks
+                    thumb_tip = hand_landmarks.landmark[4]
                     index_tip = hand_landmarks.landmark[8]
+                    middle_tip = hand_landmarks.landmark[12]
                     
                     if self.tracking_enabled:
-                        # Convert hand coordinates to raw target pixels on screen
+                        # 1. VELVET CURSOR SMOOTHING MOVEMENT
                         raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
                         raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
                         
-                        # Apply Exponential Moving Average (EMA) Filtering for stabilization
                         if self.prev_x == 0 and self.prev_y == 0:
                             smooth_x, smooth_y = raw_x, raw_y
                         else:
+                            # Advanced Exponential Moving Average execution
                             smooth_x = int(self.prev_x + self.smoothing * (raw_x - self.prev_x))
                             smooth_y = int(self.prev_y + self.smoothing * (raw_y - self.prev_y))
                         
-                        # Pin pointer targets strictly within monitor view edges
+                        # Apply desktop clipping boundaries
                         smooth_x = max(0, min(smooth_x, self.screen_width - 1))
                         smooth_y = max(0, min(smooth_y, self.screen_height - 1))
                         
-                        # Move the OS cursor instantly to the smoothed coordinates
                         pyautogui.moveTo(smooth_x, smooth_y)
-                        
-                        # Save current positions for calculations in the next frame
                         self.prev_x, self.prev_y = smooth_x, smooth_y
 
-                        # 2. LEFT CLICK GESTURE LOGIC (Pinch Thumb #4 and Index #8 together)
-                        thumb_tip = hand_landmarks.landmark[4]
-                        
-                        # Calculate Euclidean distance between the two tips in 3D space
-                        distance = math.sqrt(
+                        # 2. FIXED LEFT CLICK LOGIC (Using stable 2D Math: X & Y Only)
+                        left_dist = math.sqrt(
                             (index_tip.x - thumb_tip.x)**2 + 
-                            (index_tip.y - thumb_tip.y)**2 + 
-                            (index_tip.z - thumb_tip.z)**2
+                            (index_tip.y - thumb_tip.y)**2
                         )
                         
-                        # Check if fingers are pinching together
-                        if distance < self.click_threshold:
-                            if not self.is_clicking:
-                                pyautogui.click()
-                                self.is_clicking = True  # Lock the click state so it doesn't spam clicks
+                        if left_dist < self.click_threshold:
+                            if not self.is_left_clicking:
+                                pyautogui.click(button='left')
+                                self.is_left_clicking = True  
                         else:
-                            self.is_clicking = False  # Reset lock when you open your hand back up
+                            self.is_left_clicking = False  
 
-            # Send the updated frame and data up to the dashboard interface
+                        # 3. FIXED RIGHT CLICK LOGIC (Using stable 2D Math: X & Y Only)
+                        right_dist = math.sqrt(
+                            (middle_tip.x - thumb_tip.x)**2 + 
+                            (middle_tip.y - thumb_tip.y)**2
+                        )
+                        
+                        if right_dist < self.click_threshold:
+                            if not self.is_right_clicking:
+                                pyautogui.click(button='right')
+                                self.is_right_clicking = True  
+                        else:
+                            self.is_right_clicking = False  
+
+            # Push visual frame array and statistics up to PyQt layer
             self.change_pixmap_signal.emit(frame)
             self.status_signal.emit(hand_detected, round(fps, 1))
 
@@ -141,7 +156,6 @@ class ZeroTouchApp(QMainWindow):
         self.setWindowTitle("ZeroTouch - AI Productivity Tool")
         self.setMinimumSize(1100, 700)
         
-        # Build and link the background tracking thread
         self.engine = HandTrackingEngine()
         self.engine.change_pixmap_signal.connect(self.update_image)
         self.engine.status_signal.connect(self.update_status)
@@ -155,7 +169,7 @@ class ZeroTouchApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Left Sidebar View
+        # Left Sidebar Layout
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setFixedWidth(220)
@@ -176,12 +190,12 @@ class ZeroTouchApp(QMainWindow):
         sidebar_layout.addWidget(settings_btn)
         sidebar_layout.addStretch()
 
-        # Right View Pane (Header + Dynamic Stack)
+        # Right Workspace View Container
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(25, 25, 25, 25)
 
-        # Dashboard Top Action / Metric Bar
+        # Application Top Metrics Bar
         header_layout = QHBoxLayout()
         self.title_lbl = QLabel("<h1>Dashboard</h1>")
         self.status_lbl = QLabel("Status: Ready")
@@ -194,12 +208,10 @@ class ZeroTouchApp(QMainWindow):
         right_layout.addLayout(header_layout)
         right_layout.addSpacing(20)
 
-        # Create our workspace stack where different screens can swap
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.create_dashboard_view())
         right_layout.addWidget(self.content_stack)
 
-        # Tie everything together to build the framework
         main_layout.addWidget(self.sidebar)
         main_layout.addWidget(right_container)
         self.setCentralWidget(main_widget)
@@ -207,13 +219,12 @@ class ZeroTouchApp(QMainWindow):
         self.apply_premium_stylesheet()
 
     def create_dashboard_view(self):
-        """Generates the Main Layout Grid holding the Video Feed and Settings Controls"""
         dash_page = QWidget()
         layout = QHBoxLayout(dash_page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
         
-        # Left Dashboard Side: AI Live Feed Preview Card
+        # Camera Frame Live Preview Card
         preview_card = QWidget()
         preview_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34;")
         preview_layout = QVBoxLayout(preview_card)
@@ -222,13 +233,12 @@ class ZeroTouchApp(QMainWindow):
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.video_label)
         
-        # Right Dashboard Side: System Adjustments / Switches Panel
+        # Configuration Controls Panel Card
         controls_card = QWidget()
         controls_card.setFixedWidth(320)
         controls_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34; padding: 15px;")
         controls_layout = QVBoxLayout(controls_card)
         
-        # Quick Control Master Action Button
         self.toggle_tracking_btn = QPushButton("▶ Start Tracking Engine")
         self.toggle_tracking_btn.setStyleSheet("""
             QPushButton {
@@ -241,12 +251,11 @@ class ZeroTouchApp(QMainWindow):
         controls_layout.addWidget(self.toggle_tracking_btn)
         controls_layout.addSpacing(20)
         
-        # Configuration Modifier Sliders
         sensitivity_lbl = QLabel("<b>Cursor Sensitivity</b>")
         controls_layout.addWidget(sensitivity_lbl)
         
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(10, 30)  # Maps to 1.0x - 3.0x sensitivity
+        self.slider.setRange(10, 30)  
         self.slider.setValue(15)
         self.slider.valueChanged.connect(self.change_sensitivity)
         controls_layout.addWidget(self.slider)
@@ -258,7 +267,6 @@ class ZeroTouchApp(QMainWindow):
         return dash_page
 
     def toggle_tracking(self):
-        """Turn actual system mouse movement tracking on or off"""
         if not self.engine.tracking_enabled:
             self.engine.tracking_enabled = True
             self.toggle_tracking_btn.setText("⏸ Pause Tracking Engine")
@@ -272,7 +280,6 @@ class ZeroTouchApp(QMainWindow):
         self.engine.sensitivity = value / 10.0
 
     def update_image(self, cv_img):
-        """Accepts raw tracking output video feeds, maps it to Qt frames, and prints it"""
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
@@ -291,7 +298,6 @@ class ZeroTouchApp(QMainWindow):
             self.status_lbl.setStyleSheet("color: #F44336; font-size: 14px;")
 
     def apply_premium_stylesheet(self):
-        """Infuses global CSS rules to create an ultra-modern dark UI palette"""
         self.setStyleSheet("""
             QMainWindow { background-color: #1a1a1e; }
             QWidget#Sidebar { background-color: #111113; border-right: 1px solid #2d2d34; }
