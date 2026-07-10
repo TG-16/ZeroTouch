@@ -6,6 +6,7 @@ import pyautogui
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                              QVBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap  # Fixed: Imported QPixmap and QImage here
 
 # Disable PyAutoGUI fail-safe pause to make moving the pointer smoother
 pyautogui.FAILSAFE = False
@@ -14,7 +15,6 @@ pyautogui.FAILSAFE = False
 # 1. THE AI ENGINE THREAD
 # ==========================================
 class HandTrackingEngine(QThread):
-    # These signals allow the background AI thread to talk safely to the UI thread
     change_pixmap_signal = pyqtSignal(object)  
     status_signal = pyqtSignal(bool, float)     
 
@@ -22,7 +22,7 @@ class HandTrackingEngine(QThread):
         super().__init__()
         self._run_flag = True
         
-        # Initialize MediaPipe Hand Tracker
+        # Initialize MediaPipe Hand Tracker using the fixed library version
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
@@ -35,13 +35,10 @@ class HandTrackingEngine(QThread):
         # Settings controlled by the UI
         self.tracking_enabled = False
         self.sensitivity = 1.5
-        
-        # Screen dimensions for mapping hand coordinates to monitor coordinates
         self.screen_width, self.screen_height = pyautogui.size()
 
     def run(self):
-        # Open the default webcam
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         prev_frame_time = 0
 
         while self._run_flag:
@@ -122,9 +119,7 @@ class ZeroTouchApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ----------------------------------
         # Left Sidebar View
-        # ----------------------------------
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setFixedWidth(220)
@@ -145,9 +140,7 @@ class ZeroTouchApp(QMainWindow):
         sidebar_layout.addWidget(settings_btn)
         sidebar_layout.addStretch()
 
-        # ----------------------------------
         # Right View Pane (Header + Dynamic Stack)
-        # ----------------------------------
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(25, 25, 25, 25)
@@ -247,8 +240,8 @@ class ZeroTouchApp(QMainWindow):
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
-        convert_to_Qt_format = cv2.QtGui.QImage(rgb_image.data, w, h, bytes_per_line, cv2.QtGui.QImage.Format.Format_RGB888) if hasattr(cv2, 'QtGui') else \
-                               from_array_to_qimage(rgb_image, w, h, bytes_per_line)
+        
+        convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         p = convert_to_Qt_format.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio)
         self.video_label.setPixmap(QPixmap.fromImage(p))
 
@@ -277,10 +270,6 @@ class ZeroTouchApp(QMainWindow):
     def closeEvent(self, event):
         self.engine.stop()
         event.accept()
-
-def from_array_to_qimage(images_arr, width, height, bytes_line):
-    from PyQt6.QtGui import QImage
-    return QImage(images_arr.data, width, height, bytes_line, QImage.Format.Format_RGB888)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
