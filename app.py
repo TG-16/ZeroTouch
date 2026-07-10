@@ -3,12 +3,13 @@ import cv2
 import mediapipe as mp
 import time
 import pyautogui
+import math
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                              QVBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap  # Fixed: Imported QPixmap and QImage here
+from PyQt6.QtGui import QImage, QPixmap
 
-# Disable PyAutoGUI fail-safe pause to make moving the pointer smoother
+# Disable PyAutoGUI fail-safe pause to ensure ultra-smooth cursor panning
 pyautogui.FAILSAFE = False
 
 # ==========================================
@@ -22,7 +23,7 @@ class HandTrackingEngine(QThread):
         super().__init__()
         self._run_flag = True
         
-        # Initialize MediaPipe Hand Tracker using the fixed library version
+        # Initialize MediaPipe Hand Tracker
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
@@ -37,7 +38,16 @@ class HandTrackingEngine(QThread):
         self.sensitivity = 1.5
         self.screen_width, self.screen_height = pyautogui.size()
 
+        # Smooth Tracking Variables (EMA Filter)
+        self.prev_x, self.prev_y = 0, 0
+        self.smoothing = 0.25  # Lower value = Smoother but slightly slower. Higher value = Faster but more jittery.
+
+        # Click State Variables to prevent accidental multiple clicks
+        self.is_clicking = False
+        self.click_threshold = 0.04  # Distance threshold between finger tips to register a pinch click
+
     def run(self):
+        # Using Camera Index 1 as discovered by your setup configuration
         cap = cv2.VideoCapture(1)
         prev_frame_time = 0
 
@@ -46,17 +56,16 @@ class HandTrackingEngine(QThread):
             if not ret:
                 continue
 
-            # Mirror the frame horizontally so your movements match what you see
+            # Mirror the frame horizontally
             frame = cv2.flip(frame, 1)
             h, w, c = frame.shape
             
-            # MediaPipe requires RGB images, but OpenCV reads in BGR
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.hands.process(rgb_frame)
 
             hand_detected = False
 
-            # Calculate Frames Per Second (FPS)
+            # Calculate FPS
             new_frame_time = time.time()
             fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
             prev_frame_time = new_frame_time
@@ -64,25 +73,53 @@ class HandTrackingEngine(QThread):
             if results.multi_hand_landmarks:
                 hand_detected = True
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw skeletal lines over your hand in the preview
+                    # Draw skeletal lines over your hand in the preview window
                     self.mp_drawing.draw_landmarks(
                         frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                     )
                     
-                    # Track Index Finger Tip (Landmark #8)
+                    # 1. CURSOR MOVEMENT LOGIC (Index Finger Tip is Landmark #8)
                     index_tip = hand_landmarks.landmark[8]
                     
                     if self.tracking_enabled:
-                        # Convert hand normalized coordinates (0.0 to 1.0) to screen pixel targets
-                        target_x = int(index_tip.x * self.screen_width * self.sensitivity)
-                        target_y = int(index_tip.y * self.screen_height * self.sensitivity)
+                        # Convert hand coordinates to raw target pixels on screen
+                        raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
+                        raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
                         
-                        # Prevent pointer from leaving monitor boundaries
-                        target_x = max(0, min(target_x, self.screen_width - 1))
-                        target_y = max(0, min(target_y, self.screen_height - 1))
+                        # Apply Exponential Moving Average (EMA) Filtering for stabilization
+                        if self.prev_x == 0 and self.prev_y == 0:
+                            smooth_x, smooth_y = raw_x, raw_y
+                        else:
+                            smooth_x = int(self.prev_x + self.smoothing * (raw_x - self.prev_x))
+                            smooth_y = int(self.prev_y + self.smoothing * (raw_y - self.prev_y))
                         
-                        # Command the OS mouse to move smoothly
-                        pyautogui.moveTo(target_x, target_y, duration=0.01)
+                        # Pin pointer targets strictly within monitor view edges
+                        smooth_x = max(0, min(smooth_x, self.screen_width - 1))
+                        smooth_y = max(0, min(smooth_y, self.screen_height - 1))
+                        
+                        # Move the OS cursor instantly to the smoothed coordinates
+                        pyautogui.moveTo(smooth_x, smooth_y)
+                        
+                        # Save current positions for calculations in the next frame
+                        self.prev_x, self.prev_y = smooth_x, smooth_y
+
+                        # 2. LEFT CLICK GESTURE LOGIC (Pinch Thumb #4 and Index #8 together)
+                        thumb_tip = hand_landmarks.landmark[4]
+                        
+                        # Calculate Euclidean distance between the two tips in 3D space
+                        distance = math.sqrt(
+                            (index_tip.x - thumb_tip.x)**2 + 
+                            (index_tip.y - thumb_tip.y)**2 + 
+                            (index_tip.z - thumb_tip.z)**2
+                        )
+                        
+                        # Check if fingers are pinching together
+                        if distance < self.click_threshold:
+                            if not self.is_clicking:
+                                pyautogui.click()
+                                self.is_clicking = True  # Lock the click state so it doesn't spam clicks
+                        else:
+                            self.is_clicking = False  # Reset lock when you open your hand back up
 
             # Send the updated frame and data up to the dashboard interface
             self.change_pixmap_signal.emit(frame)
@@ -113,7 +150,6 @@ class ZeroTouchApp(QMainWindow):
         self.engine.start()
 
     def init_ui(self):
-        # Core master layout layout splits Left (Sidebar) and Right (Main Window Content)
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
