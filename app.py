@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
-# CRITICAL FIX FOR FPS & COOLDOWNS: Remove PyAutoGUI delays entirely
+# CRITICAL SYSTEM OVERRIDES FOR RAW PERFORMANCE
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
 
@@ -30,31 +30,30 @@ class HandTrackingEngine(QThread):
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            model_complexity=0,       # 0 = Ultra-fast processing mode
+            model_complexity=0,       # Performance optimized
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6
         )
         
-        # Settings controlled by the UI
+        # UI Mapped Settings
         self.tracking_enabled = False
-        self.sensitivity = 1.5
+        self.sensitivity = 1.7        # Slightly increased to reduce hand strain
         self.screen_width, self.screen_height = pyautogui.size()
 
-        # Ultra-Smooth Tracking Filter Settings
+        # Dynamic Tracking Variables (Removes input lag while keeping stability)
         self.prev_x, self.prev_y = 0, 0
-        self.smoothing = 0.12  # Lowered from 0.20 to completely eliminate minor shaking
-
-        # Click State Locks
-        self.is_left_clicking = False
+        
+        # State Holding Flags for Drag & Drop / Continuous holding
+        self.left_button_held = False
         self.is_right_clicking = False
         
-        # 2D Click Threshold (adjusted for screen-space scale normalization)
+        # Standardized 2D Hand Space Thresholds
         self.click_threshold = 0.04  
 
     def run(self):
         cap = cv2.VideoCapture(1)
         
-        # Camera Resolution Optimization
+        # Force lower hardware capture resolution to eliminate processing backlog lag
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
@@ -73,7 +72,7 @@ class HandTrackingEngine(QThread):
 
             hand_detected = False
 
-            # Calculate actual loop execution FPS
+            # Calculate FPS
             new_frame_time = time.time()
             fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
             prev_frame_time = new_frame_time
@@ -81,53 +80,59 @@ class HandTrackingEngine(QThread):
             if results.multi_hand_landmarks:
                 hand_detected = True
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw skeletal overlay lines
+                    # Draw visual skeletal map
                     self.mp_drawing.draw_landmarks(
                         frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                     )
                     
-                    # Extract raw structural landmarks
+                    # Target tracked landmarks
                     thumb_tip = hand_landmarks.landmark[4]
                     index_tip = hand_landmarks.landmark[8]
                     middle_tip = hand_landmarks.landmark[12]
                     
                     if self.tracking_enabled:
-                        # 1. VELVET CURSOR SMOOTHING MOVEMENT
+                        # 1. ADAPTIVE CURSOR SMOOTHING (Fixes both jitter AND ice gliding)
                         raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
                         raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
                         
                         if self.prev_x == 0 and self.prev_y == 0:
                             smooth_x, smooth_y = raw_x, raw_y
                         else:
-                            # Advanced Exponential Moving Average execution
-                            smooth_x = int(self.prev_x + self.smoothing * (raw_x - self.prev_x))
-                            smooth_y = int(self.prev_y + self.smoothing * (raw_y - self.prev_y))
+                            # Calculate frame-by-frame physical movement speed
+                            movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
+                            
+                            # Dynamic smoothing engine step
+                            if movement_distance > 30:
+                                # Quick motion: reduce smoothing completely to eliminate cursor lag/gliding
+                                current_smoothing = 0.60
+                            else:
+                                # Slow motion / hovering: apply heavy smoothing to lock out jitter
+                                current_smoothing = 0.15
+                                
+                            smooth_x = int(self.prev_x + current_smoothing * (raw_x - self.prev_x))
+                            smooth_y = int(self.prev_y + current_smoothing * (raw_y - self.prev_y))
                         
-                        # Apply desktop clipping boundaries
+                        # Apply desktop boundary snapping
                         smooth_x = max(0, min(smooth_x, self.screen_width - 1))
                         smooth_y = max(0, min(smooth_y, self.screen_height - 1))
                         
                         pyautogui.moveTo(smooth_x, smooth_y)
                         self.prev_x, self.prev_y = smooth_x, smooth_y
 
-                        # 2. FIXED LEFT CLICK LOGIC (Using stable 2D Math: X & Y Only)
-                        left_dist = math.sqrt(
-                            (index_tip.x - thumb_tip.x)**2 + 
-                            (index_tip.y - thumb_tip.y)**2
-                        )
+                        # 2. UPDATED MOUSE DOWN / UP LEFT CLICK MECHANIC (Thumb + Index)
+                        left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
                         
                         if left_dist < self.click_threshold:
-                            if not self.is_left_clicking:
-                                pyautogui.click(button='left')
-                                self.is_left_clicking = True  
+                            if not self.left_button_held:
+                                pyautogui.mouseDown(button='left')
+                                self.left_button_held = True
                         else:
-                            self.is_left_clicking = False  
+                            if self.left_button_held:
+                                pyautogui.mouseUp(button='left')
+                                self.left_button_held = False
 
-                        # 3. FIXED RIGHT CLICK LOGIC (Using stable 2D Math: X & Y Only)
-                        right_dist = math.sqrt(
-                            (middle_tip.x - thumb_tip.x)**2 + 
-                            (middle_tip.y - thumb_tip.y)**2
-                        )
+                        # 3. RIGHT CLICK LOGIC (Thumb + Middle Finger)
+                        right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
                         
                         if right_dist < self.click_threshold:
                             if not self.is_right_clicking:
@@ -136,13 +141,21 @@ class HandTrackingEngine(QThread):
                         else:
                             self.is_right_clicking = False  
 
-            # Push visual frame array and statistics up to PyQt layer
+            # Safely release physical mouse state locks if your hand leaves the camera frame completely
+            elif self.left_button_held:
+                pyautogui.mouseUp(button='left')
+                self.left_button_held = False
+
+            # Push visual update data array layers up to the PyQt application dashboard
             self.change_pixmap_signal.emit(frame)
             self.status_signal.emit(hand_detected, round(fps, 1))
 
         cap.release()
 
     def stop(self):
+        # Clean up mouse click state before quitting application
+        if self.left_button_held:
+            pyautogui.mouseUp(button='left')
         self._run_flag = False
         self.wait()
 
@@ -169,7 +182,7 @@ class ZeroTouchApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Left Sidebar Layout
+        # Left Sidebar View Panel
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setFixedWidth(220)
@@ -195,7 +208,7 @@ class ZeroTouchApp(QMainWindow):
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(25, 25, 25, 25)
 
-        # Application Top Metrics Bar
+        # Header Action / Status Display Bar
         header_layout = QHBoxLayout()
         self.title_lbl = QLabel("<h1>Dashboard</h1>")
         self.status_lbl = QLabel("Status: Ready")
@@ -224,7 +237,7 @@ class ZeroTouchApp(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
         
-        # Camera Frame Live Preview Card
+        # Camera Feed Box Card Setup
         preview_card = QWidget()
         preview_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34;")
         preview_layout = QVBoxLayout(preview_card)
@@ -233,7 +246,7 @@ class ZeroTouchApp(QMainWindow):
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.video_label)
         
-        # Configuration Controls Panel Card
+        # Dynamic Sliders & Action Toggle Buttons Panel
         controls_card = QWidget()
         controls_card.setFixedWidth(320)
         controls_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34; padding: 15px;")
@@ -256,7 +269,7 @@ class ZeroTouchApp(QMainWindow):
         
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(10, 30)  
-        self.slider.setValue(15)
+        self.slider.setValue(17)
         self.slider.valueChanged.connect(self.change_sensitivity)
         controls_layout.addWidget(self.slider)
         
