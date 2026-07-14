@@ -29,7 +29,7 @@ class HandTrackingEngine(QThread):
         self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=2,          # UPDATED: Track both hands simultaneously
+            max_num_hands=2,          # Track both hands simultaneously
             model_complexity=0,       # Fast processing mode
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6
@@ -49,6 +49,11 @@ class HandTrackingEngine(QThread):
         
         # Standardized Gesturing Limits
         self.click_threshold = 0.04  
+
+        # Angle Tracking Variables for Right Hand Rotation (Volume Mode)
+        self.prev_angle = None
+        self.angle_accumulator = 0.0
+        self.rotation_threshold = 15.0  # Degrees of rotation required to trigger a volume step
 
     def run(self):
         cap = cv2.VideoCapture(1)
@@ -70,6 +75,7 @@ class HandTrackingEngine(QThread):
 
             hand_detected = False
             left_freeze = False
+            left_volume_mode = False
             right_hand_landmarks = None
 
             # Dynamic Loop FPS Reader
@@ -80,7 +86,7 @@ class HandTrackingEngine(QThread):
             if results.multi_hand_landmarks and results.multi_handedness:
                 hand_detected = True
                 
-                # FIRST PASS: Find the Left Hand state to see if we need to freeze tracking
+                # FIRST PASS: Find the Left Hand state
                 for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
                     # Get Left/Right classification (relative to flipped frame)
                     handedness = results.multi_handedness[idx].classification[0].label
@@ -93,90 +99,138 @@ class HandTrackingEngine(QThread):
                     if handedness == "Left":
                         wrist = hand_landmarks.landmark[0]
                         
-                        # Box/Fist Gesture Detection logic:
-                        # Check if finger tips (8, 12, 16, 20) are curled below their base knuckles (5, 9, 13, 17)
-                        fingers_curled = 0
+                        # Gather fingers curled status relative to MCP knuckles
+                        # Tips: Index(8), Middle(12), Ring(16), Pinky(20)
+                        # MCPs: Index(5), Middle(9), Ring(13), Pinky(17)
                         tips = [8, 12, 16, 20]
                         mcps = [5, 9, 13, 17]
+                        fingers_curled = []
                         
                         for tip_idx, mcp_idx in zip(tips, mcps):
                             tip = hand_landmarks.landmark[tip_idx]
                             mcp = hand_landmarks.landmark[mcp_idx]
                             
-                            # If finger tip is physically closer to the wrist than its base joint, it is curled
                             dist_to_wrist = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
                             mcp_to_wrist = math.hypot(mcp.x - wrist.x, mcp.y - wrist.y)
-                            if dist_to_wrist < mcp_to_wrist:
-                                fingers_curled += 1
+                            
+                            # True if finger is curled inward towards palm
+                            fingers_curled.append(dist_to_wrist < mcp_to_wrist)
                         
-                        # If 3 or more fingers are curled, the left hand is making a "box" / fist
-                        if fingers_curled >= 3:
+                        # GESTURE 1: Left Index Pointing Up, other 3 fingers curled (VOLUME MODE)
+                        # fingers_curled format: [Index, Middle, Ring, Pinky]
+                        if not fingers_curled[0] and fingers_curled[1] and fingers_curled[2] and fingers_curled[3]:
+                            left_volume_mode = True
+                            
+                        # GESTURE 2: Full Box / Fist (3 or more fingers curled, including index)
+                        elif sum(fingers_curled) >= 3:
                             left_freeze = True
                             
                     elif handedness == "Right":
                         right_hand_landmarks = hand_landmarks
 
-                # SECOND PASS: Process Right Hand actions (Cursor and Clicks)
+                # SECOND PASS: Process Right Hand actions
                 if right_hand_landmarks and self.tracking_enabled:
                     thumb_tip = right_hand_landmarks.landmark[4]
                     index_tip = right_hand_landmarks.landmark[8]
                     middle_tip = right_hand_landmarks.landmark[12]
+                    wrist_r = right_hand_landmarks.landmark[0]
 
-                    # 1. CURSOR MOVEMENT (Only if Left Hand is NOT making a "box" / freezing)
-                    if not left_freeze:
-                        raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
-                        raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
+                    # MODE A: VOLUME KNOB GESTURE (Left hand pointing, Right hand rotating)
+                    if left_volume_mode:
+                        # Draw visual confirmation of volume mode
+                        cv2.putText(frame, "VOLUME CONTROL ACTIVE", (10, 30), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                         
-                        if self.prev_x == 0 and self.prev_y == 0:
-                            smooth_x, smooth_y = raw_x, raw_y
-                        else:
-                            movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
+                        # Use Right Hand's index tip relative to the wrist to compute angle of rotation
+                        dx = index_tip.x - wrist_r.x
+                        dy = index_tip.y - wrist_r.y
+                        current_angle = math.degrees(math.atan2(dy, dx))
+                        
+                        if self.prev_angle is not None:
+                            # Calculate the delta difference between frames
+                            delta_angle = current_angle - self.prev_angle
                             
-                            # Adaptive Smoothing Filter
-                            if movement_distance > 30:
-                                current_smoothing = 0.60
-                            else:
-                                current_smoothing = 0.15
+                            # Wrap angle jumps when cross-cutting boundary quadrant limits (-180 to 180 degrees)
+                            if delta_angle > 180:
+                                delta_angle -= 360
+                            elif delta_angle < -180:
+                                delta_angle += 360
                                 
-                            smooth_x = int(self.prev_x + current_smoothing * (raw_x - self.prev_x))
-                            smooth_y = int(self.prev_y + current_smoothing * (raw_y - self.prev_y))
+                            self.angle_accumulator += delta_angle
+                            
+                            # Process Accumulator increments to trigger physical OS Volume keys
+                            if self.angle_accumulator >= self.rotation_threshold:
+                                pyautogui.press("volumeup")
+                                self.angle_accumulator = 0.0
+                            elif self.angle_accumulator <= -self.rotation_threshold:
+                                pyautogui.press("volumedown")
+                                self.angle_accumulator = 0.0
                         
-                        smooth_x = max(0, min(smooth_x, self.screen_width - 1))
-                        smooth_y = max(0, min(smooth_y, self.screen_height - 1))
+                        self.prev_angle = current_angle
+                    
+                    # MODE B: NORMAL CURSOR MOVEMENT
+                    else:
+                        # Reset tracking angles when leaving volume mode
+                        self.prev_angle = None
+                        self.angle_accumulator = 0.0
+
+                        if not left_freeze:
+                            raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
+                            raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
+                            
+                            if self.prev_x == 0 and self.prev_y == 0:
+                                smooth_x, smooth_y = raw_x, raw_y
+                            else:
+                                movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
+                                
+                                # Adaptive Smoothing Filter
+                                if movement_distance > 30:
+                                    current_smoothing = 0.60
+                                else:
+                                    current_smoothing = 0.15
+                                    
+                                smooth_x = int(self.prev_x + current_smoothing * (raw_x - self.prev_x))
+                                smooth_y = int(self.prev_y + current_smoothing * (raw_y - self.prev_y))
+                            
+                            smooth_x = max(0, min(smooth_x, self.screen_width - 1))
+                            smooth_y = max(0, min(smooth_y, self.screen_height - 1))
+                            
+                            pyautogui.moveTo(smooth_x, smooth_y)
+                            self.prev_x, self.prev_y = smooth_x, smooth_y
+                        else:
+                            # Draw visual indicator that tracking is locked
+                            cv2.putText(frame, "TRACKING LOCKED (Left Hand Box)", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+                        # 2. LEFT CLICK / HOLD GESTURE (Disabled during Volume Mode to prevent accidental clicks)
+                        left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
                         
-                        pyautogui.moveTo(smooth_x, smooth_y)
-                        self.prev_x, self.prev_y = smooth_x, smooth_y
-                    else:
-                        # Draw visual indicator on camera stream that tracking is locked
-                        cv2.putText(frame, "TRACKING LOCKED (Left Hand Box)", (10, 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                        if left_dist < self.click_threshold:
+                            if not self.left_button_held:
+                                pyautogui.mouseDown(button='left')
+                                self.left_button_held = True
+                        else:
+                            if self.left_button_held:
+                                pyautogui.mouseUp(button='left')
+                                self.left_button_held = False
 
-                    # 2. LEFT CLICK / HOLD GESTURE (Works even when movement is frozen!)
-                    left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
-                    
-                    if left_dist < self.click_threshold:
-                        if not self.left_button_held:
-                            pyautogui.mouseDown(button='left')
-                            self.left_button_held = True
-                    else:
-                        if self.left_button_held:
-                            pyautogui.mouseUp(button='left')
-                            self.left_button_held = False
-
-                    # 3. RIGHT CLICK GESTURE (Works even when movement is frozen!)
-                    right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
-                    
-                    if right_dist < self.click_threshold:
-                        if not self.is_right_clicking:
-                            pyautogui.click(button='right')
-                            self.is_right_clicking = True  
+                        # 3. RIGHT CLICK GESTURE (Disabled during Volume Mode to prevent accidental clicks)
+                        right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
+                        
+                        if right_dist < self.click_threshold:
+                            if not self.is_right_clicking:
+                                pyautogui.click(button='right')
+                                self.is_right_clicking = True  
                         else:
                             self.is_right_clicking = False  
-
-            # Safety release if tracking drops unexpectedly
-            elif self.left_button_held:
-                pyautogui.mouseUp(button='left')
-                self.left_button_held = False
+            else:
+                # Reset tracking angles if hands go out of view
+                self.prev_angle = None
+                self.angle_accumulator = 0.0
+                
+                if self.left_button_held:
+                    pyautogui.mouseUp(button='left')
+                    self.left_button_held = False
 
             self.change_pixmap_signal.emit(frame)
             self.status_signal.emit(hand_detected, round(fps, 1))
