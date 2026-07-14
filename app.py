@@ -24,13 +24,13 @@ class HandTrackingEngine(QThread):
         super().__init__()
         self._run_flag = True
         
-        # Initialize MediaPipe Hand Tracker
+        # Initialize MediaPipe Hand Tracker for 2 hands
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
-            model_complexity=0,
+            max_num_hands=2,          # UPDATED: Track both hands simultaneously
+            model_complexity=0,       # Fast processing mode
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6
         )
@@ -40,16 +40,15 @@ class HandTrackingEngine(QThread):
         self.sensitivity = 1.7        
         self.screen_width, self.screen_height = pyautogui.size()
 
-        # Dynamic Tracking Filter Position Trackers
+        # Dynamic Tracking Filter Position Trackers (Right Hand)
         self.prev_x, self.prev_y = 0, 0
         
         # Gesture Hold State Controls
         self.left_button_held = False
         self.is_right_clicking = False
         
-        # Standardized Gesturing Limits (2D Normalized Screen Space)
+        # Standardized Gesturing Limits
         self.click_threshold = 0.04  
-        self.thumb_bend_threshold = 0.06  # Distance limit between thumb tip and index base
 
     def run(self):
         cap = cv2.VideoCapture(1)
@@ -70,79 +69,111 @@ class HandTrackingEngine(QThread):
             results = self.hands.process(rgb_frame)
 
             hand_detected = False
+            left_freeze = False
+            right_hand_landmarks = None
 
             # Dynamic Loop FPS Reader
             new_frame_time = time.time()
             fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
             prev_frame_time = new_frame_time
 
-            if results.multi_hand_landmarks:
+            if results.multi_hand_landmarks and results.multi_handedness:
                 hand_detected = True
-                for hand_landmarks in results.multi_hand_landmarks:
+                
+                # FIRST PASS: Find the Left Hand state to see if we need to freeze tracking
+                for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                    # Get Left/Right classification (relative to flipped frame)
+                    handedness = results.multi_handedness[idx].classification[0].label
+                    
+                    # Draw skeletal connections for both hands
                     self.mp_drawing.draw_landmarks(
                         frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                     )
                     
-                    # Target tracking key nodes
-                    thumb_tip = hand_landmarks.landmark[4]
-                    index_base = hand_landmarks.landmark[5]   # UPDATED: Index Finger Base for the freezing point
-                    index_tip = hand_landmarks.landmark[8]
-                    middle_tip = hand_landmarks.landmark[12]
-                    
-                    if self.tracking_enabled:
-                        # 1. OPTIMIZED TRACKING LOCK DETECTOR (Thumb Tip to Index Base)
-                        thumb_bend_dist = math.hypot(thumb_tip.x - index_base.x, thumb_tip.y - index_base.y)
+                    if handedness == "Left":
+                        wrist = hand_landmarks.landmark[0]
                         
-                        # Only move the cursor if the thumb is safely away from the index base
-                        if thumb_bend_dist > self.thumb_bend_threshold:
-                            raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
-                            raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
+                        # Box/Fist Gesture Detection logic:
+                        # Check if finger tips (8, 12, 16, 20) are curled below their base knuckles (5, 9, 13, 17)
+                        fingers_curled = 0
+                        tips = [8, 12, 16, 20]
+                        mcps = [5, 9, 13, 17]
+                        
+                        for tip_idx, mcp_idx in zip(tips, mcps):
+                            tip = hand_landmarks.landmark[tip_idx]
+                            mcp = hand_landmarks.landmark[mcp_idx]
                             
-                            if self.prev_x == 0 and self.prev_y == 0:
-                                smooth_x, smooth_y = raw_x, raw_y
+                            # If finger tip is physically closer to the wrist than its base joint, it is curled
+                            dist_to_wrist = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
+                            mcp_to_wrist = math.hypot(mcp.x - wrist.x, mcp.y - wrist.y)
+                            if dist_to_wrist < mcp_to_wrist:
+                                fingers_curled += 1
+                        
+                        # If 3 or more fingers are curled, the left hand is making a "box" / fist
+                        if fingers_curled >= 3:
+                            left_freeze = True
+                            
+                    elif handedness == "Right":
+                        right_hand_landmarks = hand_landmarks
+
+                # SECOND PASS: Process Right Hand actions (Cursor and Clicks)
+                if right_hand_landmarks and self.tracking_enabled:
+                    thumb_tip = right_hand_landmarks.landmark[4]
+                    index_tip = right_hand_landmarks.landmark[8]
+                    middle_tip = right_hand_landmarks.landmark[12]
+
+                    # 1. CURSOR MOVEMENT (Only if Left Hand is NOT making a "box" / freezing)
+                    if not left_freeze:
+                        raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
+                        raw_y = int(index_tip.y * self.screen_height * self.sensitivity)
+                        
+                        if self.prev_x == 0 and self.prev_y == 0:
+                            smooth_x, smooth_y = raw_x, raw_y
+                        else:
+                            movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
+                            
+                            # Adaptive Smoothing Filter
+                            if movement_distance > 30:
+                                current_smoothing = 0.60
                             else:
-                                movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
+                                current_smoothing = 0.15
                                 
-                                # Adaptive Smoothing Calculator
-                                if movement_distance > 30:
-                                    current_smoothing = 0.60
-                                else:
-                                    current_smoothing = 0.15
-                                    
-                                smooth_x = int(self.prev_x + current_smoothing * (raw_x - self.prev_x))
-                                smooth_y = int(self.prev_y + current_smoothing * (raw_y - self.prev_y))
-                            
-                            smooth_x = max(0, min(smooth_x, self.screen_width - 1))
-                            smooth_y = max(0, min(smooth_y, self.screen_height - 1))
-                            
-                            pyautogui.moveTo(smooth_x, smooth_y)
-                            self.prev_x, self.prev_y = smooth_x, smooth_y
-                        else:
-                            # Render visual text confirming the freeze lock is active
-                            cv2.putText(frame, "TRACKING LOCKED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-
-                        # 2. CONTINUOUS ACTION DRAG LEFT CLICK (Thumb + Index Tip)
-                        left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
+                            smooth_x = int(self.prev_x + current_smoothing * (raw_x - self.prev_x))
+                            smooth_y = int(self.prev_y + current_smoothing * (raw_y - self.prev_y))
                         
-                        if left_dist < self.click_threshold:
-                            if not self.left_button_held:
-                                pyautogui.mouseDown(button='left')
-                                self.left_button_held = True
-                        else:
-                            if self.left_button_held:
-                                pyautogui.mouseUp(button='left')
-                                self.left_button_held = False
-
-                        # 3. RIGHT CLICK MECHANIC (Thumb + Middle Tip)
-                        right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
+                        smooth_x = max(0, min(smooth_x, self.screen_width - 1))
+                        smooth_y = max(0, min(smooth_y, self.screen_height - 1))
                         
-                        if right_dist < self.click_threshold:
-                            if not self.is_right_clicking:
-                                pyautogui.click(button='right')
-                                self.is_right_clicking = True  
+                        pyautogui.moveTo(smooth_x, smooth_y)
+                        self.prev_x, self.prev_y = smooth_x, smooth_y
+                    else:
+                        # Draw visual indicator on camera stream that tracking is locked
+                        cv2.putText(frame, "TRACKING LOCKED (Left Hand Box)", (10, 30), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+                    # 2. LEFT CLICK / HOLD GESTURE (Works even when movement is frozen!)
+                    left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
+                    
+                    if left_dist < self.click_threshold:
+                        if not self.left_button_held:
+                            pyautogui.mouseDown(button='left')
+                            self.left_button_held = True
+                    else:
+                        if self.left_button_held:
+                            pyautogui.mouseUp(button='left')
+                            self.left_button_held = False
+
+                    # 3. RIGHT CLICK GESTURE (Works even when movement is frozen!)
+                    right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
+                    
+                    if right_dist < self.click_threshold:
+                        if not self.is_right_clicking:
+                            pyautogui.click(button='right')
+                            self.is_right_clicking = True  
                         else:
                             self.is_right_clicking = False  
 
+            # Safety release if tracking drops unexpectedly
             elif self.left_button_held:
                 pyautogui.mouseUp(button='left')
                 self.left_button_held = False
