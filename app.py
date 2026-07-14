@@ -9,6 +9,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
+# Dynamic import helper for cross-platform hardware brightness control
+try:
+    import screen_brightness_control as sbc
+    HAS_SBC = True
+except ImportError:
+    HAS_SBC = False
+
 # SYSTEM OVERRIDES FOR PERFORMANCE
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
@@ -50,10 +57,12 @@ class HandTrackingEngine(QThread):
         # Standardized Gesturing Limits
         self.click_threshold = 0.04  
 
-        # Angle Tracking Variables for Right Hand Rotation (Volume Mode)
+        # Angle Tracking Variables for Right Hand Rotation (Volume & Brightness Modes)
         self.prev_angle = None
         self.angle_accumulator = 0.0
-        self.rotation_threshold = 15.0  # Degrees of rotation required to trigger a volume step
+        
+        # UPDATED: Lower threshold = much faster, highly responsive tracking speed
+        self.rotation_threshold = 5.0  
 
     def run(self):
         cap = cv2.VideoCapture(1)
@@ -76,6 +85,7 @@ class HandTrackingEngine(QThread):
             hand_detected = False
             left_freeze = False
             left_volume_mode = False
+            left_brightness_mode = False
             right_hand_landmarks = None
 
             # Dynamic Loop FPS Reader
@@ -116,12 +126,16 @@ class HandTrackingEngine(QThread):
                             # True if finger is curled inward towards palm
                             fingers_curled.append(dist_to_wrist < mcp_to_wrist)
                         
-                        # GESTURE 1: Left Index Pointing Up, other 3 fingers curled (VOLUME MODE)
-                        # fingers_curled format: [Index, Middle, Ring, Pinky]
+                        # GESTURE 1: Left Index Pointing Up only (VOLUME MODE)
+                        # fingers_curled index mapping: [Index, Middle, Ring, Pinky]
                         if not fingers_curled[0] and fingers_curled[1] and fingers_curled[2] and fingers_curled[3]:
                             left_volume_mode = True
                             
-                        # GESTURE 2: Full Box / Fist (3 or more fingers curled, including index)
+                        # GESTURE 2: Left Index & Middle Pointing Up (BRIGHTNESS MODE)
+                        elif not fingers_curled[0] and not fingers_curled[1] and fingers_curled[2] and fingers_curled[3]:
+                            left_brightness_mode = True
+                            
+                        # GESTURE 3: Full Box / Fist (3 or more fingers curled)
                         elif sum(fingers_curled) >= 3:
                             left_freeze = True
                             
@@ -135,11 +149,14 @@ class HandTrackingEngine(QThread):
                     middle_tip = right_hand_landmarks.landmark[12]
                     wrist_r = right_hand_landmarks.landmark[0]
 
-                    # MODE A: VOLUME KNOB GESTURE (Left hand pointing, Right hand rotating)
-                    if left_volume_mode:
-                        # Draw visual confirmation of volume mode
-                        cv2.putText(frame, "VOLUME CONTROL ACTIVE", (10, 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    # MODE A: VOLUME KNOB OR BRIGHTNESS KNOB ACTIVE
+                    if left_volume_mode or left_brightness_mode:
+                        if left_volume_mode:
+                            cv2.putText(frame, "VOLUME CONTROL ACTIVE", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        else:
+                            cv2.putText(frame, "BRIGHTNESS CONTROL ACTIVE", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                         
                         # Use Right Hand's index tip relative to the wrist to compute angle of rotation
                         dx = index_tip.x - wrist_r.x
@@ -147,10 +164,9 @@ class HandTrackingEngine(QThread):
                         current_angle = math.degrees(math.atan2(dy, dx))
                         
                         if self.prev_angle is not None:
-                            # Calculate the delta difference between frames
                             delta_angle = current_angle - self.prev_angle
                             
-                            # Wrap angle jumps when cross-cutting boundary quadrant limits (-180 to 180 degrees)
+                            # Wrap angle jumps when cross-cutting boundary limits
                             if delta_angle > 180:
                                 delta_angle -= 360
                             elif delta_angle < -180:
@@ -158,19 +174,42 @@ class HandTrackingEngine(QThread):
                                 
                             self.angle_accumulator += delta_angle
                             
-                            # Process Accumulator increments to trigger physical OS Volume keys
-                            if self.angle_accumulator >= self.rotation_threshold:
-                                pyautogui.press("volumeup")
-                                self.angle_accumulator = 0.0
-                            elif self.angle_accumulator <= -self.rotation_threshold:
-                                pyautogui.press("volumedown")
+                            # Process Accumulator increments to trigger physical actions
+                            if abs(self.angle_accumulator) >= self.rotation_threshold:
+                                steps = int(abs(self.angle_accumulator) // self.rotation_threshold)
+                                is_clockwise = self.angle_accumulator > 0
+                                
+                                if left_volume_mode:
+                                    # Change Volume faster matching rotation speed steps
+                                    key_to_press = "volumeup" if is_clockwise else "volumedown"
+                                    for _ in range(steps):
+                                        pyautogui.press(key_to_press)
+                                
+                                elif left_brightness_mode:
+                                    # Adjust Brightness based on availability of package
+                                    if HAS_SBC:
+                                        try:
+                                            curr_bright = sbc.get_brightness(display=0)[0]
+                                            change = 4 * steps if is_clockwise else -4 * steps
+                                            new_bright = max(0, min(100, curr_bright + change))
+                                            sbc.set_brightness(new_bright, display=0)
+                                        except Exception:
+                                            # Fallback keyboard press
+                                            key_to_press = "displaybrightnessup" if is_clockwise else "displaybrightnessdown"
+                                            for _ in range(steps):
+                                                pyautogui.press(key_to_press)
+                                    else:
+                                        # Fallback directly to hardware simulated keys
+                                        key_to_press = "displaybrightnessup" if is_clockwise else "displaybrightnessdown"
+                                        for _ in range(steps):
+                                            pyautogui.press(key_to_press)
+                                            
                                 self.angle_accumulator = 0.0
                         
                         self.prev_angle = current_angle
                     
                     # MODE B: NORMAL CURSOR MOVEMENT
                     else:
-                        # Reset tracking angles when leaving volume mode
                         self.prev_angle = None
                         self.angle_accumulator = 0.0
 
@@ -183,7 +222,6 @@ class HandTrackingEngine(QThread):
                             else:
                                 movement_distance = math.hypot(raw_x - self.prev_x, raw_y - self.prev_y)
                                 
-                                # Adaptive Smoothing Filter
                                 if movement_distance > 30:
                                     current_smoothing = 0.60
                                 else:
@@ -202,9 +240,8 @@ class HandTrackingEngine(QThread):
                             cv2.putText(frame, "TRACKING LOCKED (Left Hand Box)", (10, 30), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
-                        # 2. LEFT CLICK / HOLD GESTURE (Disabled during Volume Mode to prevent accidental clicks)
+                        # Click processing (Disabled during control dial modes)
                         left_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
-                        
                         if left_dist < self.click_threshold:
                             if not self.left_button_held:
                                 pyautogui.mouseDown(button='left')
@@ -214,9 +251,7 @@ class HandTrackingEngine(QThread):
                                 pyautogui.mouseUp(button='left')
                                 self.left_button_held = False
 
-                        # 3. RIGHT CLICK GESTURE (Disabled during Volume Mode to prevent accidental clicks)
                         right_dist = math.hypot(middle_tip.x - thumb_tip.x, middle_tip.y - thumb_tip.y)
-                        
                         if right_dist < self.click_threshold:
                             if not self.is_right_clicking:
                                 pyautogui.click(button='right')
@@ -224,10 +259,8 @@ class HandTrackingEngine(QThread):
                         else:
                             self.is_right_clicking = False  
             else:
-                # Reset tracking angles if hands go out of view
                 self.prev_angle = None
                 self.angle_accumulator = 0.0
-                
                 if self.left_button_held:
                     pyautogui.mouseUp(button='left')
                     self.left_button_held = False
