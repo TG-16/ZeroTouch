@@ -65,6 +65,9 @@ class HandTrackingEngine(QThread):
         # Scroll Throttle Timer (prevents runaway scrolling)
         self.last_scroll_time = 0
 
+        # State Tracker for Copy/Paste Trigger
+        self.right_was_fist = False  
+
     def run(self):
         cap = cv2.VideoCapture(1)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -87,6 +90,8 @@ class HandTrackingEngine(QThread):
             left_freeze = False
             left_volume_mode = False
             left_brightness_mode = False
+            left_copy_mode = False
+            left_paste_mode = False
             
             # Scroll Mode variables
             left_scroll_speed_active = False
@@ -133,8 +138,18 @@ class HandTrackingEngine(QThread):
                         # GESTURE 2: Left index and middle pointing up (BRIGHTNESS MODE)
                         elif not fingers_curled[0] and not fingers_curled[1] and fingers_curled[2] and fingers_curled[3]:
                             left_brightness_mode = True
+
+                        # GESTURE 3: COPY MODE (Fist and raise ONLY pinky finger)
+                        elif fingers_curled[0] and fingers_curled[1] and fingers_curled[2] and not fingers_curled[3]:
+                            left_copy_mode = True
+                            left_freeze = True
+
+                        # GESTURE 4: PASTE MODE (Rock sign: Index + Pinky up, Middle + Ring curled)
+                        elif not fingers_curled[0] and fingers_curled[1] and fingers_curled[2] and not fingers_curled[3]:
+                            left_paste_mode = True
+                            left_freeze = True
                             
-                        # GESTURE 3: Open Palm (All fingers extended -> SCROLL SPEED CONTROLLER)
+                        # GESTURE 5: Open Palm (All fingers extended -> SCROLL SPEED CONTROLLER)
                         elif sum(fingers_curled) == 0:
                             left_scroll_speed_active = True
                             # Calculate speed based on how high the hand is in the frame (normalized 0.0 to 1.0)
@@ -143,7 +158,7 @@ class HandTrackingEngine(QThread):
                             # Map vertical range roughly from a baseline to max sensitivity
                             scroll_multiplier = max(0.5, min(5.0, hand_height * 6.0))
                             
-                        # GESTURE 4: Full Box / Fist (3 or more fingers curled)
+                        # GESTURE 6: Full Box / Fist (3 or more fingers curled)
                         elif sum(fingers_curled) >= 3:
                             left_freeze = True
                             
@@ -158,8 +173,7 @@ class HandTrackingEngine(QThread):
                     middle_tip = right_hand_landmarks.landmark[12]
                     wrist_r = right_hand_landmarks.landmark[0]
 
-                    # GESTURE CHECK FOR RIGHT HAND: Is it a Thumbs-Up shape?
-                    # Check if index, middle, ring, and pinky are all curled into the palm
+                    # Analyze finger curl states for Right Hand
                     r_tips = [8, 12, 16, 20]
                     r_mcps = [5, 9, 13, 17]
                     r_fingers_curled = []
@@ -169,9 +183,43 @@ class HandTrackingEngine(QThread):
                         r_fingers_curled.append(math.hypot(t.x - wrist_r.x, t.y - wrist_r.y) < math.hypot(m.x - wrist_r.x, m.y - wrist_r.y))
                     
                     is_right_thumbs_up = sum(r_fingers_curled) >= 3
+                    right_is_fist = sum(r_fingers_curled) >= 3
+                    right_is_open = sum(r_fingers_curled) == 0
 
-                    # MODE A: SCROLL ENGINE ACTIVE (Left hand open palm + Right hand thumbs up)
-                    if left_scroll_speed_active and is_right_thumbs_up:
+                    # MODE A: COPY OR PASTE COMMAND EXECUTION
+                    if left_copy_mode or left_paste_mode:
+                        if left_copy_mode:
+                            cv2.putText(frame, "COPY MODE (MOUSE LOCKED)", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                        else:
+                            cv2.putText(frame, "PASTE MODE (MOUSE LOCKED)", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                        # Arming step: detect if right hand becomes a fist
+                        if right_is_fist:
+                            self.right_was_fist = True
+                            cv2.putText(frame, "TRIGGER ARMED (FIST DETECTED)", (10, 60), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        
+                        # Fire step: detect transition from fist to open palm
+                        elif right_is_open and self.right_was_fist:
+                            if left_copy_mode:
+                                pyautogui.hotkey('ctrl', 'c')
+                                cv2.putText(frame, "!!! COPIED !!!", (10, 90), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 3)
+                            elif left_paste_mode:
+                                pyautogui.hotkey('ctrl', 'v')
+                                cv2.putText(frame, "!!! PASTED !!!", (10, 90), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 3)
+                            
+                            self.right_was_fist = False  # Reset trigger state
+                        else:
+                            cv2.putText(frame, "Right Hand: Fist then Open to trigger", (10, 60), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+                    # MODE B: SCROLL ENGINE ACTIVE (Left hand open palm + Right hand thumbs up)
+                    elif left_scroll_speed_active and is_right_thumbs_up:
+                        self.right_was_fist = False # Clear active copy/paste latch states
                         # Determine direction of the thumb relative to its base knuckle
                         dx = thumb_tip.x - thumb_mcp.x
                         dy = thumb_tip.y - thumb_mcp.y
@@ -207,8 +255,9 @@ class HandTrackingEngine(QThread):
                                 
                             self.last_scroll_time = current_time
 
-                    # MODE B: VOLUME KNOB OR BRIGHTNESS KNOB ACTIVE
+                    # MODE C: VOLUME KNOB OR BRIGHTNESS KNOB ACTIVE
                     elif (left_volume_mode or left_brightness_mode) and not left_scroll_speed_active:
+                        self.right_was_fist = False # Clear active copy/paste latch states
                         if left_volume_mode:
                             cv2.putText(frame, "VOLUME CONTROL ACTIVE", (10, 30), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -259,10 +308,11 @@ class HandTrackingEngine(QThread):
                         
                         self.prev_angle = current_angle
                     
-                    # MODE C: NORMAL CURSOR MOVEMENT
+                    # MODE D: NORMAL CURSOR MOVEMENT
                     else:
                         self.prev_angle = None
                         self.angle_accumulator = 0.0
+                        self.right_was_fist = False # Clear active copy/paste latch states
 
                         if not left_freeze:
                             raw_x = int(index_tip.x * self.screen_width * self.sensitivity)
@@ -287,7 +337,7 @@ class HandTrackingEngine(QThread):
                             pyautogui.moveTo(smooth_x, smooth_y)
                             self.prev_x, self.prev_y = smooth_x, smooth_y
                         else:
-                            cv2.putText(frame, "TRACKING LOCKED (Left Hand Box)", (10, 30), 
+                            cv2.putText(frame, "TRACKING LOCKED (Left Hand Command)", (10, 30), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
                         # Click processing (Disabled during control/scroll modes)
@@ -311,6 +361,7 @@ class HandTrackingEngine(QThread):
             else:
                 self.prev_angle = None
                 self.angle_accumulator = 0.0
+                self.right_was_fist = False
                 if self.left_button_held:
                     pyautogui.mouseUp(button='left')
                     self.left_button_held = False
