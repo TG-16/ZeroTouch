@@ -78,7 +78,7 @@ class HandTrackingEngine(QThread):
         self._run_flag = True
         
         # Camera Routing Controls
-        self.camera_source = 1  # Can be int (index) or str (IP Camera URL)
+        self.camera_source = 0  # Can be int (index) or str (IP Camera URL)
         self.source_changed = False
         
         # Initialize MediaPipe Hand Tracker
@@ -636,7 +636,7 @@ class ZeroTouchApp(QMainWindow):
         return container
 
     # ----------------------------------------
-    # SCREEN VIEW 2: Gesture Directory
+    # SCREEN VIEW 2: Gesture Directory (UPDATED)
     # ----------------------------------------
     def create_gestures_view(self):
         page = QWidget()
@@ -656,25 +656,26 @@ class ZeroTouchApp(QMainWindow):
         scroll_widget = QWidget()
         scroll_widget.setObjectName("TransparentBase")
         grid = QGridLayout(scroll_widget)
-        grid.setSpacing(15)
+        grid.setSpacing(20)  # Standardized spacing for visual cards
         grid.setContentsMargins(0, 0, 10, 0)
 
+        # Mapping gestures to your local development assets: g1.png, g2.png, etc.
         gestures_data = [
-            ("Move Cursor", "Pointer Action", "Right Hand movement tracking (Neutral index)", "🔗 Dynamic Mapping"),
-            ("Left Click", "Primary Click", "Index Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Press Toggle"),
-            ("Right Click", "Secondary Click", "Middle Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Double Click bind"),
-            ("Scroll Mode", "Document Scroll", "Left Hand Open Palm + Right Hand Thumbs up pointing direction", "🔄 Throttle Enabled"),
-            ("Volume Control", "Audio Adjuster", "Left Index up + Rotate Right index clockwise/counter-clockwise", "🔊 Sys Bind"),
-            ("Brightness Control", "Hardware Control", "Left Index+Middle up + Rotate Right index relative to wrist", "🔆 SBC Bridge"),
-            ("Copy Macro", "Keyboard Event", "Left Pinky up + Right Hand transition: Fist to Open Palm", "📋 CTRL + C Bind"),
-            ("Paste Macro", "Keyboard Event", "Left Rock Sign + Right Hand transition: Fist to Open Palm", "📋 CTRL + V Bind"),
-            ("Screenshot Macro", "OS Action Sequence", "Left Thumb extended up + Right Hand Fist to Open Palm", "📸 Auto Save Local PNG")
+            ("Move Cursor", "Pointer Action", "Right Hand movement tracking (Neutral index)", "🔗 Dynamic Mapping", "g1.png"),
+            ("Left Click", "Primary Click", "Index Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Press Toggle", "g2.png"),
+            ("Right Click", "Secondary Click", "Middle Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Double Click bind", "g3.png"),
+            ("Scroll Mode", "Document Scroll", "Left Hand Open Palm + Right Hand Thumbs up pointing direction", "🔄 Throttle Enabled", "g4.png"),
+            ("Volume Control", "Audio Adjuster", "Left Index up + Rotate Right index clockwise/counter-clockwise", "🔊 Sys Bind", "g5.png"),
+            ("Brightness Control", "Hardware Control", "Left Index+Middle up + Rotate Right index relative to wrist", "🔆 SBC Bridge", "g6.png"),
+            ("Copy Macro", "Keyboard Event", "Left Pinky up + Right Hand transition: Fist to Open Palm", "📋 CTRL + C Bind", "g7.png"),
+            ("Paste Macro", "Keyboard Event", "Left Rock Sign + Right Hand transition: Fist to Open Palm", "📋 CTRL + V Bind", "g8.png"),
+            ("Screenshot Macro", "OS Action Sequence", "Left Thumb extended up + Right Hand Fist to Open Palm", "📸 Auto Save Local PNG", "g9.png")
         ]
 
         row = 0
         col = 0
-        for name, category, logic, bind in gestures_data:
-            card = self.create_gesture_card(name, category, logic, bind)
+        for name, category, logic, bind, img_filename in gestures_data:
+            card = self.create_gesture_card(name, category, logic, bind, img_filename)
             grid.addWidget(card, row, col)
             col += 1
             if col > 1:
@@ -685,13 +686,43 @@ class ZeroTouchApp(QMainWindow):
         layout.addWidget(scroll)
         return page
 
-    def create_gesture_card(self, name, category, desc, mapping):
+    def create_gesture_card(self, name, category, desc, mapping, img_filename):
         card = QFrame()
         card.setObjectName("GestureCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 20, 20, 20)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(18, 18, 18, 18)
+        card_layout.setSpacing(12)
 
+        # 1. Gesture Illustration Container
+        img_label = QLabel()
+        img_label.setObjectName("GestureImagePlaceholder")
+        img_label.setFixedSize(280, 150)
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Load and scale local image, falling back elegantly if missing
+        pixmap = QPixmap(img_filename)
+        if not pixmap.isNull():
+            scaled_pixmap = pixmap.scaled(
+                img_label.size(), 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            img_label.setPixmap(scaled_pixmap)
+        else:
+            # Elegant dashed fallback styling when assets are missing
+            img_label.setText(f"[ {name} Sketch ]\n({img_filename} missing)")
+            img_label.setStyleSheet("""
+                background-color: #0B0B0C; 
+                color: #5C5C64; 
+                border: 1px dashed #232328; 
+                border-radius: 8px;
+                font-family: 'Consolas', monospace;
+                font-size: 11px;
+            """)
+        
+        card_layout.addWidget(img_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # 2. Header details (Name & Tag)
         top_bar = QHBoxLayout()
         name_lbl = QLabel(name)
         name_lbl.setObjectName("GestureName")
@@ -703,11 +734,14 @@ class ZeroTouchApp(QMainWindow):
         top_bar.addWidget(cat_lbl)
         card_layout.addLayout(top_bar)
 
+        # 3. Description text block
         desc_lbl = QLabel(desc)
         desc_lbl.setObjectName("GestureDesc")
         desc_lbl.setWordWrap(True)
+        desc_lbl.setMinimumHeight(40)
         card_layout.addWidget(desc_lbl)
 
+        # 4. Action Bindings footer
         bottom_bar = QHBoxLayout()
         map_lbl = QLabel(mapping)
         map_lbl.setObjectName("GestureMapping")
@@ -1024,8 +1058,20 @@ class ZeroTouchApp(QMainWindow):
             QScrollArea#DashboardScroll { border: none; background-color: transparent; }
             QWidget#TransparentBase { background-color: transparent; }
 
-            QFrame#GestureCard { background-color: #17171A; border: 1px solid #232328; border-radius: 12px; }
-            QFrame#GestureCard:hover { border: 1px solid #00F0FF; }
+            QFrame#GestureCard { 
+                background-color: #17171A; 
+                border: 1px solid #232328; 
+                border-radius: 12px; 
+                min-width: 310px;
+            }
+            QFrame#GestureCard:hover { 
+                border: 1px solid #00F0FF; 
+            }
+            QLabel#GestureImagePlaceholder {
+                background-color: #0B0B0C;
+                border: 1px solid #1E1E22;
+                border-radius: 8px;
+            }
             QLabel#GestureName { color: #FFFFFF; font-size: 15px; font-weight: 700; }
             QLabel#GestureCategory { color: #00F0FF; background-color: rgba(0, 240, 255, 0.08); border: 1px solid rgba(0, 240, 255, 0.2); border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 700; }
             QLabel#GestureDesc { color: #8C8C96; }
