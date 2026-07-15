@@ -8,7 +8,7 @@ Here's a prompt that should work well with AI UI design tools like Uizard, Visil
 >
 > The design should be clean, futuristic, and professional, similar to applications from Microsoft, Adobe, or Logitech. Use a minimal interface with rounded corners, subtle shadows, glassmorphism effects where appropriate, smooth animations, and a dark theme with blue and cyan accent colors.
 >
-> The application name is **AirMouse AI**.
+> The application name is **ZeroTouch**.
 >
 > ### Main Layout
 >

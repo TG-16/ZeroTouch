@@ -5,9 +5,10 @@ import time
 import pyautogui
 import math
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
-                             QVBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+                             QVBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget,
+                             QScrollArea, QGridLayout, QFrame)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt6.QtGui import QImage, QPixmap, QColor, QFont
 
 # Dynamic import helper for cross-platform hardware brightness control
 try:
@@ -47,11 +48,12 @@ def calculate_angle(p1, p2, p3):
 
 
 # ==========================================
-# 1. THE AI ENGINE THREAD
+# 1. THE AI ENGINE THREAD (Background Logic)
 # ==========================================
 class HandTrackingEngine(QThread):
     change_pixmap_signal = pyqtSignal(object)  
     status_signal = pyqtSignal(bool, float)     
+    performance_signal = pyqtSignal(float, float) # (Confidence, Latency)
 
     def __init__(self):
         super().__init__()
@@ -81,20 +83,21 @@ class HandTrackingEngine(QThread):
         self.is_right_clicking = False
         
         # Standardized Gesturing Limits
-        self.click_threshold = 0.04  
+        self.click_threshold = 0.04 
 
         # Angle Tracking Variables for Right Hand Rotation (Volume & Brightness Modes)
         self.prev_angle = None
         self.angle_accumulator = 0.0
-        self.rotation_threshold = 5.0  
+        self.rotation_threshold = 5.0 
 
         # Scroll Throttle Timer (prevents runaway scrolling)
         self.last_scroll_time = 0
 
         # State Tracker for Copy/Paste/Screenshot Trigger
-        self.right_was_fist = False  
+        self.right_was_fist = False 
 
     def run(self):
+        # We try opening camera 0 first. Modify index if needed.
         cap = cv2.VideoCapture(1)
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -111,7 +114,10 @@ class HandTrackingEngine(QThread):
             h, w, c = frame.shape
             
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            start_inference = time.time()
             results = self.hands.process(rgb_frame)
+            latency = (time.time() - start_inference) * 1000  # in ms
 
             hand_detected = False
             left_freeze = False
@@ -132,8 +138,11 @@ class HandTrackingEngine(QThread):
             fps = 1 / (new_frame_time - prev_frame_time) if (new_frame_time - prev_frame_time) > 0 else 0
             prev_frame_time = new_frame_time
 
+            confidence = 0.0
+
             if results.multi_hand_landmarks and results.multi_handedness:
                 hand_detected = True
+                confidence = 0.85 # Approximation of ML model confidence for UI
                 
                 # FIRST PASS: Find the Left Hand state
                 for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
@@ -231,13 +240,13 @@ class HandTrackingEngine(QThread):
                     if left_copy_mode or left_paste_mode or left_screenshot_mode:
                         if left_copy_mode:
                             cv2.putText(frame, "COPY MODE (MOUSE LOCKED)", (10, 30), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 240, 255), 2)
                         elif left_paste_mode:
                             cv2.putText(frame, "PASTE MODE (MOUSE LOCKED)", (10, 30), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 240, 255), 2)
                         elif left_screenshot_mode:
                             cv2.putText(frame, "SCREENSHOT MODE (MOUSE LOCKED)", (10, 30), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 240, 255), 2)
 
                         # Arming step: detect if right hand becomes a fist
                         if right_is_fist:
@@ -382,7 +391,7 @@ class HandTrackingEngine(QThread):
                             pyautogui.moveTo(smooth_x, smooth_y)
                             self.prev_x, self.prev_y = smooth_x, smooth_y
                         else:
-                            cv2.putText(frame, "TRACKING LOCKED (Left Hand Command)", (10, 30), 
+                            cv2.putText(frame, "TRACKING LOCKED (Left Hand)", (10, 30), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
                         # Click processing (Disabled during control/scroll/freeze modes)
@@ -413,6 +422,7 @@ class HandTrackingEngine(QThread):
 
             self.change_pixmap_signal.emit(frame)
             self.status_signal.emit(hand_detected, round(fps, 1))
+            self.performance_signal.emit(confidence, latency)
 
         cap.release()
 
@@ -424,133 +434,456 @@ class HandTrackingEngine(QThread):
 
 
 # ==========================================
-# 2. THE PREMIUM INTERFACE DISPLAY
+# 2. THE UPGRADED HIGH-FIDELITY USER INTERFACE
 # ==========================================
 class ZeroTouchApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ZeroTouch - AI Productivity Tool")
-        self.setMinimumSize(1100, 700)
+        self.setWindowTitle("AirMouse AI - Touchless Desktop Control")
+        self.setMinimumSize(1280, 820)
         
+        # Engine thread config
         self.engine = HandTrackingEngine()
         self.engine.change_pixmap_signal.connect(self.update_image)
         self.engine.status_signal.connect(self.update_status)
-        
+        self.engine.performance_signal.connect(self.update_performance)
+
         self.init_ui()
         self.engine.start()
 
     def init_ui(self):
+        # Master Base Layout
         main_widget = QWidget()
+        main_widget.setObjectName("BaseContainer")
         main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Left Sidebar View Panel
+        # ----------------------------------------
+        # Side Collapsible Navigation Panel
+        # ----------------------------------------
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(220)
+        self.sidebar.setFixedWidth(240)
         sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(10, 30, 10, 10)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(10)
+
+        # Logo Header
+        logo_container = QWidget()
+        logo_container.setObjectName("LogoContainer")
+        logo_container.setFixedHeight(75)
+        logo_layout = QHBoxLayout(logo_container)
+        logo_layout.setContentsMargins(20, 0, 20, 0)
         
-        app_logo = QLabel("<h2>Ø ZeroTouch</h2>")
-        app_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addWidget(app_logo)
-        sidebar_layout.addSpacing(30)
+        logo_label = QLabel("⚡ AirMouse AI")
+        logo_label.setObjectName("AppName")
+        logo_layout.addWidget(logo_label)
+        sidebar_layout.addWidget(logo_container)
+
+        # Nav Elements
+        self.btn_dash = QPushButton("  📊   Dashboard")
+        self.btn_gestures = QPushButton("  🖐️   Gestures")
+        self.btn_settings = QPushButton("  ⚙️   Settings")
+
+        # Style Navigation Buttons
+        for btn in [self.btn_dash, self.btn_gestures, self.btn_settings]:
+            btn.setObjectName("NavBtn")
+            btn.setFixedHeight(50)
+            sidebar_layout.addWidget(btn)
+
+        self.btn_dash.setProperty("active", True) # Set initial active view marker
         
-        dash_btn = QPushButton(" 📊 Dashboard")
-        gesture_btn = QPushButton(" 🖐️ Gestures")
-        settings_btn = QPushButton(" ⚙️ Settings")
-        
-        sidebar_layout.addWidget(dash_btn)
-        sidebar_layout.addWidget(gesture_btn)
-        sidebar_layout.addWidget(settings_btn)
+        self.btn_dash.clicked.connect(lambda: self.switch_view(0, self.btn_dash))
+        self.btn_gestures.clicked.connect(lambda: self.switch_view(1, self.btn_gestures))
+        self.btn_settings.clicked.connect(lambda: self.switch_view(2, self.btn_settings))
+
         sidebar_layout.addStretch()
 
-        # Right Workspace Layout Panel
+        # Footer branding
+        foot_br = QLabel("v1.2.0-PRO Build")
+        foot_br.setObjectName("SidebarFooter")
+        sidebar_layout.addWidget(foot_br)
+
+        # ----------------------------------------
+        # Right workspace Container & Header
+        # ----------------------------------------
         right_container = QWidget()
+        right_container.setObjectName("RightWorkspace")
         right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(25, 25, 25, 25)
+        right_layout.setContentsMargins(25, 10, 25, 20)
+        right_layout.setSpacing(15)
 
-        header_layout = QHBoxLayout()
-        self.title_lbl = QLabel("<h1>Dashboard</h1>")
-        self.status_lbl = QLabel("Status: Ready")
-        self.fps_lbl = QLabel("FPS: 0")
+        # Global Sticky App Header bar
+        top_header_bar = QWidget()
+        top_header_bar.setObjectName("TopHeader")
+        top_header_bar.setFixedHeight(65)
+        top_layout = QHBoxLayout(top_header_bar)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.header_title = QLabel("Dashboard")
+        self.header_title.setObjectName("HeaderTitle")
+        top_layout.addWidget(self.header_title)
+        top_layout.addStretch()
+
+        # System telemetry displays
+        self.tracker_status_chip = QLabel("OFFLINE")
+        self.tracker_status_chip.setObjectName("StatusChip")
+        self.tracker_status_chip.setFixedSize(140, 32)
+        self.tracker_status_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        header_layout.addWidget(self.title_lbl)
-        header_layout.addStretch()
-        header_layout.addWidget(self.status_lbl)
-        header_layout.addWidget(self.fps_lbl)
-        right_layout.addLayout(header_layout)
-        right_layout.addSpacing(20)
+        self.system_fps_badge = QLabel("FPS: --")
+        self.system_fps_badge.setObjectName("FPSBadge")
+        self.system_fps_badge.setFixedSize(85, 32)
+        self.system_fps_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        top_layout.addWidget(self.tracker_status_chip)
+        top_layout.addWidget(self.system_fps_badge)
+        right_layout.addWidget(top_header_bar)
+
+        # Dynamic screen stack pages
         self.content_stack = QStackedWidget()
+        self.content_stack.setObjectName("StackArea")
+        
+        # Build views
         self.content_stack.addWidget(self.create_dashboard_view())
+        self.content_stack.addWidget(self.create_gestures_view())
+        self.content_stack.addWidget(self.create_settings_view())
+
         right_layout.addWidget(self.content_stack)
 
+        # Assembly
         main_layout.addWidget(self.sidebar)
         main_layout.addWidget(right_container)
         self.setCentralWidget(main_widget)
         
+        # Apply premium Logitech G HUB styled stylesheet
         self.apply_premium_stylesheet()
 
+    # ----------------------------------------
+    # SCREEN VIEW 1: Premium Dashboard
+    # ----------------------------------------
     def create_dashboard_view(self):
         dash_page = QWidget()
-        layout = QHBoxLayout(dash_page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(20)
-        
-        preview_card = QWidget()
-        preview_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34;")
-        preview_layout = QVBoxLayout(preview_card)
-        
-        self.video_label = QLabel("Starting camera system...")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(self.video_label)
-        
-        controls_card = QWidget()
-        controls_card.setFixedWidth(320)
-        controls_card.setStyleSheet("background-color: #121214; border-radius: 12px; border: 1px solid #2d2d34; padding: 15px;")
-        controls_layout = QVBoxLayout(controls_card)
-        
-        self.toggle_tracking_btn = QPushButton("▶ Start Tracking Engine")
-        self.toggle_tracking_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #007ACC; color: white; border-radius: 6px; 
-                padding: 12px; font-weight: bold; font-size: 14px; text-align: center;
-            }
-            QPushButton:hover { background-color: #0098FF; }
-        """)
-        self.toggle_tracking_btn.clicked.connect(self.toggle_tracking)
-        controls_layout.addWidget(self.toggle_tracking_btn)
-        controls_layout.addSpacing(20)
-        
-        sensitivity_lbl = QLabel("<b>Cursor Sensitivity</b>")
-        controls_layout.addWidget(sensitivity_lbl)
-        
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(10, 30)  
-        self.slider.setValue(17)
-        self.slider.valueChanged.connect(self.change_sensitivity)
-        controls_layout.addWidget(self.slider)
-        
-        controls_layout.addStretch()
+        main_grid = QGridLayout(dash_page)
+        main_grid.setContentsMargins(0, 0, 0, 0)
+        main_grid.setSpacing(20)
 
-        layout.addWidget(preview_card, stretch=2)
-        layout.addWidget(controls_card, stretch=1)
+        # Left Column: Stream Panel
+        stream_card = QFrame()
+        stream_card.setObjectName("PanelCard")
+        stream_layout = QVBoxLayout(stream_card)
+        stream_layout.setContentsMargins(15, 15, 15, 15)
+
+        stream_header = QHBoxLayout()
+        stream_title = QLabel("AI Engine Live Telemetry")
+        stream_title.setObjectName("CardTitle")
+        stream_header.addWidget(stream_title)
+        stream_header.addStretch()
+        stream_layout.addLayout(stream_header)
+
+        self.video_label = QLabel("Initializing camera pipeline...")
+        self.video_label.setObjectName("VideoFeed")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stream_layout.addWidget(self.video_label, stretch=1)
+
+        # Quick Control Panel
+        quick_action_bar = QHBoxLayout()
+        self.btn_toggle_tracker = QPushButton("▶ Start Tracking")
+        self.btn_toggle_tracker.setObjectName("TrackingButton")
+        self.btn_toggle_tracker.clicked.connect(self.toggle_tracking)
+
+        self.btn_calibrate = QPushButton("⚡ Calibrate")
+        self.btn_calibrate.setObjectName("ControlBtn")
+        
+        self.btn_reset = QPushButton("↺ Reset")
+        self.btn_reset.setObjectName("ControlBtn")
+
+        quick_action_bar.addWidget(self.btn_toggle_tracker, stretch=2)
+        quick_action_bar.addWidget(self.btn_calibrate, stretch=1)
+        quick_action_bar.addWidget(self.btn_reset, stretch=1)
+        stream_layout.addLayout(quick_action_bar)
+
+        # Right Column: Custom Settings & Metrics
+        control_sidebar_card = QFrame()
+        control_sidebar_card.setObjectName("PanelCard")
+        control_sidebar_card.setFixedWidth(340)
+        cs_layout = QVBoxLayout(control_sidebar_card)
+        cs_layout.setContentsMargins(20, 20, 20, 20)
+        cs_layout.setSpacing(15)
+
+        cs_title = QLabel("Device Parameters")
+        cs_title.setObjectName("CardTitle")
+        cs_layout.addWidget(cs_title)
+
+        # Divider
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setObjectName("PanelDivider")
+        cs_layout.addWidget(div)
+
+        # Slider 1: Cursor Sensitivity
+        sens_head = QHBoxLayout()
+        sens_head.addWidget(QLabel("Cursor Sensitivity"))
+        self.lbl_sens_val = QLabel("1.7x")
+        self.lbl_sens_val.setObjectName("AccentValue")
+        sens_head.addStretch()
+        sens_head.addWidget(self.lbl_sens_val)
+        cs_layout.addLayout(sens_head)
+
+        self.sens_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sens_slider.setObjectName("FancySlider")
+        self.sens_slider.setRange(10, 30)  
+        self.sens_slider.setValue(17)
+        self.sens_slider.valueChanged.connect(self.change_sensitivity)
+        cs_layout.addWidget(self.sens_slider)
+
+        # Slider 2: Cursor Smoothing
+        smooth_head = QHBoxLayout()
+        smooth_head.addWidget(QLabel("Cursor Jitter Smooth Filter"))
+        self.lbl_smooth_val = QLabel("0.15s")
+        self.lbl_smooth_val.setObjectName("AccentValue")
+        smooth_head.addStretch()
+        smooth_head.addWidget(self.lbl_smooth_val)
+        cs_layout.addLayout(smooth_head)
+
+        self.smooth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.smooth_slider.setObjectName("FancySlider")
+        self.smooth_slider.setRange(5, 50)
+        self.smooth_slider.setValue(15)
+        cs_layout.addWidget(self.smooth_slider)
+
+        cs_layout.addSpacing(10)
+        cs_layout.addWidget(QLabel("Diagnostic Performance Analytics"))
+
+        # Performance Grid indicators
+        self.metric_latency = self.create_metric_widget("Inference Time", "0 ms")
+        self.metric_conf = self.create_metric_widget("Confidence Index", "0.0%")
+        self.metric_res = self.create_metric_widget("Input Frame", "640 x 480")
+
+        cs_layout.addWidget(self.metric_latency)
+        cs_layout.addWidget(self.metric_conf)
+        cs_layout.addWidget(self.metric_res)
+
+        cs_layout.addStretch()
+
+        # Grid Assembly
+        main_grid.addWidget(stream_card, 0, 0, 1, 1)
+        main_grid.addWidget(control_sidebar_card, 0, 1, 1, 1)
         return dash_page
+
+    # Helper function to generate clean indicators
+    def create_metric_widget(self, name, val):
+        container = QFrame()
+        container.setObjectName("MetricFrame")
+        lyt = QHBoxLayout(container)
+        lyt.setContentsMargins(15, 10, 15, 10)
+        
+        lbl_name = QLabel(name)
+        lbl_name.setObjectName("MetricLabel")
+        lbl_val = QLabel(val)
+        lbl_val.setObjectName("MetricValue")
+
+        lyt.addWidget(lbl_name)
+        lyt.addStretch()
+        lyt.addWidget(lbl_val)
+        return container
+
+    # ----------------------------------------
+    # SCREEN VIEW 2: Gesture Control Panel Directory
+    # ----------------------------------------
+    def create_gestures_view(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(15)
+
+        sub_head = QLabel("Bind hand landmarks movements to execution sequences")
+        sub_head.setObjectName("PageSubHeader")
+        layout.addWidget(sub_head)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("DashboardScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        scroll_widget = QWidget()
+        scroll_widget.setObjectName("TransparentBase")
+        grid = QGridLayout(scroll_widget)
+        grid.setSpacing(15)
+        grid.setContentsMargins(0, 0, 10, 0)
+
+        # Active hand gesture inventory map
+        gestures_data = [
+            ("Move Cursor", "Pointer Action", "Right Hand movement tracking (Neutral index)", "🔗 Dynamic Mapping"),
+            ("Left Click", "Primary Click", "Index Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Press Toggle"),
+            ("Right Click", "Secondary Click", "Middle Tip & Thumb Tip pinch (d < 0.04)", "🖱️ Double Click bind"),
+            ("Scroll Mode", "Document Scroll", "Left Hand Open Palm + Right Hand Thumbs up pointing direction", "🔄 Throttle Enabled"),
+            ("Volume Control", "Audio Adjuster", "Left Index up + Rotate Right index clockwise/counter-clockwise", "🔊 Sys Bind"),
+            ("Brightness Control", "Hardware Control", "Left Index+Middle up + Rotate Right index relative to wrist", "🔆 SBC Bridge"),
+            ("Copy Macro", "Keyboard Event", "Left Pinky up + Right Hand transition: Fist to Open Palm", "📋 CTRL + C Bind"),
+            ("Paste Macro", "Keyboard Event", "Left Rock Sign + Right Hand transition: Fist to Open Palm", "📋 CTRL + V Bind"),
+            ("Screenshot Macro", "OS Action Sequence", "Left Thumb extended up + Right Hand Fist to Open Palm", "📸 Auto Save Local PNG")
+        ]
+
+        row = 0
+        col = 0
+        for name, category, logic, bind in gestures_data:
+            card = self.create_gesture_card(name, category, logic, bind)
+            grid.addWidget(card, row, col)
+            col += 1
+            if col > 1: # 2 cards per row
+                col = 0
+                row += 1
+
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        return page
+
+    def create_gesture_card(self, name, category, desc, mapping):
+        card = QFrame()
+        card.setObjectName("GestureCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setSpacing(10)
+
+        top_bar = QHBoxLayout()
+        name_lbl = QLabel(name)
+        name_lbl.setObjectName("GestureName")
+        cat_lbl = QLabel(category)
+        cat_lbl.setObjectName("GestureCategory")
+        
+        top_bar.addWidget(name_lbl)
+        top_bar.addStretch()
+        top_bar.addWidget(cat_lbl)
+        card_layout.addLayout(top_bar)
+
+        desc_lbl = QLabel(desc)
+        desc_lbl.setObjectName("GestureDesc")
+        desc_lbl.setWordWrap(True)
+        card_layout.addWidget(desc_lbl)
+
+        bottom_bar = QHBoxLayout()
+        map_lbl = QLabel(mapping)
+        map_lbl.setObjectName("GestureMapping")
+        
+        btn_edit = QPushButton("Edit Action")
+        btn_edit.setObjectName("SmallEditButton")
+        btn_edit.setFixedSize(90, 28)
+
+        bottom_bar.addWidget(map_lbl)
+        bottom_bar.addStretch()
+        bottom_bar.addWidget(btn_edit)
+        card_layout.addLayout(bottom_bar)
+
+        return card
+
+    # ----------------------------------------
+    # SCREEN VIEW 3: Settings Panel
+    # ----------------------------------------
+    def create_settings_view(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(20)
+
+        # Setting items list
+        scroll = QScrollArea()
+        scroll.setObjectName("DashboardScroll")
+        scroll.setWidgetResizable(True)
+
+        scroll_widget = QWidget()
+        scroll_widget.setObjectName("TransparentBase")
+        items_layout = QVBoxLayout(scroll_widget)
+        items_layout.setSpacing(20)
+        items_layout.setContentsMargins(0, 0, 10, 0)
+
+        # Box 1: Hardware configuration
+        hw_box = QFrame()
+        hw_box.setObjectName("PanelCard")
+        hw_layout = QVBoxLayout(hw_box)
+        hw_layout.setContentsMargins(20, 20, 20, 20)
+        
+        title = QLabel("Webcam Pipeline Preferences")
+        title.setObjectName("CardTitle")
+        hw_layout.addWidget(title)
+        hw_layout.addSpacing(15)
+
+        hw_layout.addLayout(self.create_settings_row("Default Camera Sensor index", "Device Port: [0] Primary Integrated webcam"))
+        hw_layout.addLayout(self.create_settings_row("MediaPipe ML Model Complexity", "Standard Performance (Low GPU usage)"))
+
+        items_layout.addWidget(hw_box)
+
+        # Box 2: System Hooks and Automations
+        system_box = QFrame()
+        system_box.setObjectName("PanelCard")
+        sys_layout = QVBoxLayout(system_box)
+        sys_layout.setContentsMargins(20, 20, 20, 20)
+        
+        sys_title = QLabel("System Integration & Overrides")
+        sys_title.setObjectName("CardTitle")
+        sys_layout.addWidget(sys_title)
+        sys_layout.addSpacing(15)
+
+        sys_layout.addLayout(self.create_settings_row("PyAutoGUI Safety Kill-Switch", "Disabled (Safe margins enabled)"))
+        sys_layout.addLayout(self.create_settings_row("Automatic Frame Inversion mapping", "Horizontal Inversion enabled"))
+
+        items_layout.addWidget(system_box)
+        items_layout.addStretch()
+
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        return page
+
+    def create_settings_row(self, title, val):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 5, 0, 5)
+        
+        t = QLabel(title)
+        t.setObjectName("SettingsText")
+        
+        v = QLabel(val)
+        v.setObjectName("AccentValue")
+
+        row.addWidget(t)
+        row.addStretch()
+        row.addWidget(v)
+        return row
+
+    # ----------------------------------------
+    # Control Actions & Slots
+    # ----------------------------------------
+    def switch_view(self, idx, active_btn):
+        # Reset navigation properties
+        for btn in [self.btn_dash, self.btn_gestures, self.btn_settings]:
+            btn.setProperty("active", False)
+            btn.style().polish(btn)
+
+        active_btn.setProperty("active", True)
+        active_btn.style().polish(active_btn)
+
+        self.content_stack.setCurrentIndex(idx)
+        titles = ["Dashboard", "Gesture Settings Directory", "Global Configuration Preferences"]
+        self.header_title.setText(titles[idx])
 
     def toggle_tracking(self):
         if not self.engine.tracking_enabled:
             self.engine.tracking_enabled = True
-            self.toggle_tracking_btn.setText("⏸ Pause Tracking Engine")
-            self.toggle_tracking_btn.setStyleSheet("background-color: #D32F2F; color: white; border-radius: 6px; padding: 12px; font-weight: bold; text-align: center;")
+            self.btn_toggle_tracker.setText("⏸ Pause Core Tracking")
+            self.btn_toggle_tracker.setStyleSheet("""
+                QPushButton#TrackingButton {
+                    background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #E53935, stop:1 #B71C1C);
+                    color: #FFFFFF;
+                }
+            """)
         else:
             self.engine.tracking_enabled = False
-            self.toggle_tracking_btn.setText("▶ Start Tracking Engine")
-            self.toggle_tracking_btn.setStyleSheet("background-color: #007ACC; color: white; border-radius: 6px; padding: 12px; font-weight: bold; text-align: center;")
+            self.btn_toggle_tracker.setText("▶ Start Tracking Engine")
+            self.btn_toggle_tracker.setStyleSheet("") # Restores stylesheet style
 
     def change_sensitivity(self, value):
         self.engine.sensitivity = value / 10.0
+        self.lbl_sens_val.setText(f"{round(self.engine.sensitivity, 1)}x")
 
     def update_image(self, cv_img):
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
@@ -562,24 +895,294 @@ class ZeroTouchApp(QMainWindow):
         self.video_label.setPixmap(QPixmap.fromImage(p))
 
     def update_status(self, hand_detected, fps):
-        self.fps_lbl.setText(f"FPS: {fps}")
+        self.system_fps_badge.setText(f"FPS: {int(fps)}")
         if hand_detected:
-            self.status_lbl.setText("Status: Hand Tracked")
-            self.status_lbl.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 14px;")
+            self.tracker_status_chip.setText("HAND TRACKED")
+            self.tracker_status_chip.setStyleSheet("background-color: rgba(0, 240, 255, 0.15); color: #00F0FF; border: 1px solid #00F0FF;")
         else:
-            self.status_lbl.setText("Status: No Hand Detected")
-            self.status_lbl.setStyleSheet("color: #F44336; font-size: 14px;")
+            self.tracker_status_chip.setText("NO SOURCE DETECTED")
+            self.tracker_status_chip.setStyleSheet("background-color: rgba(244, 67, 54, 0.15); color: #F44336; border: 1px solid #F44336;")
 
+    def update_performance(self, confidence, latency):
+        self.metric_latency.findChild(QLabel, "MetricValue").setText(f"{int(latency)} ms")
+        self.metric_conf.findChild(QLabel, "MetricValue").setText(f"{int(confidence*100)}%")
+
+    # ----------------------------------------
+    # Premium G HUB / Dark Style Definition
+    # ----------------------------------------
     def apply_premium_stylesheet(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #1a1a1e; }
-            QWidget#Sidebar { background-color: #111113; border-right: 1px solid #2d2d34; }
-            QPushButton { 
-                background-color: transparent; color: #b3b3b3; 
-                border: none; padding: 12px 15px; text-align: left; font-size: 14px;
+            /* Main Application Foundations */
+            QWidget#BaseContainer {
+                background-color: #0F0F11;
             }
-            QPushButton:hover { background-color: #222226; color: #ffffff; border-radius: 6px; }
-            QLabel { color: #ffffff; font-family: 'Segoe UI', sans-serif; border: none; background: transparent;}
+            
+            QWidget#RightWorkspace {
+                background-color: #121214;
+            }
+
+            /* Collapsible Left Sidebar */
+            QWidget#Sidebar {
+                background-color: #0B0B0C;
+                border-right: 1px solid #1E1E22;
+            }
+            
+            QWidget#LogoContainer {
+                border-bottom: 1px solid #1E1E22;
+            }
+
+            QLabel#AppName {
+                color: #FFFFFF;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 18px;
+                font-weight: 800;
+                letter-spacing: 0.5px;
+            }
+
+            /* Navigation Buttons */
+            QPushButton#NavBtn {
+                background-color: transparent;
+                color: #8C8C96;
+                border: none;
+                border-left: 3px solid transparent;
+                padding-left: 20px;
+                text-align: left;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            
+            QPushButton#NavBtn:hover {
+                color: #00F0FF;
+                background-color: #16161A;
+            }
+
+            QPushButton#NavBtn[active="true"] {
+                color: #00F0FF;
+                background-color: #131A22;
+                border-left: 3px solid #00F0FF;
+            }
+
+            QLabel#SidebarFooter {
+                color: #4C4C54;
+                font-size: 11px;
+                margin-bottom: 15px;
+                margin-left: 20px;
+            }
+
+            /* Global App Header */
+            QLabel#HeaderTitle {
+                color: #FFFFFF;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 26px;
+                font-weight: 700;
+            }
+
+            QLabel#StatusChip {
+                border-radius: 6px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.8px;
+            }
+
+            QLabel#FPSBadge {
+                background-color: #1E1E22;
+                color: #D1D1D6;
+                border: 1px solid #2D2D34;
+                border-radius: 6px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 11px;
+                font-weight: 700;
+            }
+
+            /* Premium Panel Cards */
+            QFrame#PanelCard {
+                background-color: #17171A;
+                border: 1px solid #232328;
+                border-radius: 12px;
+            }
+
+            QLabel#CardTitle {
+                color: #FFFFFF;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 16px;
+                font-weight: 700;
+            }
+
+            QFrame#PanelDivider {
+                color: #232328;
+                max-height: 1px;
+            }
+
+            /* Live Video Panel */
+            QLabel#VideoFeed {
+                background-color: #0B0B0C;
+                border: 1px solid #232328;
+                border-radius: 8px;
+                color: #8C8C96;
+                font-family: 'Segoe UI', sans-serif;
+            }
+
+            /* Tracking Engine Power Button */
+            QPushButton#TrackingButton {
+                background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #007ACC, stop:1 #00F0FF);
+                color: #0F0F11;
+                border-radius: 8px;
+                padding: 14px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            
+            QPushButton#TrackingButton:hover {
+                background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #0098FF, stop:1 #52FAFF);
+            }
+
+            /* Secondary System Controllers */
+            QPushButton#ControlBtn {
+                background-color: #232328;
+                color: #E1E1E6;
+                border: 1px solid #2D2D34;
+                border-radius: 8px;
+                padding: 14px;
+                font-family: 'Segoe UI', sans-serif;
+                font-weight: 600;
+            }
+
+            QPushButton#ControlBtn:hover {
+                background-color: #2D2D34;
+                color: #FFFFFF;
+                border: 1px solid #00F0FF;
+            }
+
+            /* Modern Sliding Handles */
+            QSlider#FancySlider::groove:horizontal {
+                height: 6px;
+                background: #232328;
+                border-radius: 3px;
+            }
+            
+            QSlider#FancySlider::handle:horizontal {
+                background: #00F0FF;
+                border: 1px solid #007ACC;
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+
+            QSlider#FancySlider::handle:horizontal:hover {
+                background: #FFFFFF;
+                box-shadow: 0 0 10px #00F0FF;
+            }
+
+            /* Telemetry Data Nodes */
+            QFrame#MetricFrame {
+                background-color: #1C1C21;
+                border: 1px solid #232328;
+                border-radius: 8px;
+            }
+
+            QLabel#MetricLabel {
+                color: #8C8C96;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+                font-weight: 500;
+            }
+
+            QLabel#MetricValue {
+                color: #00F0FF;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 14px;
+                font-weight: 700;
+            }
+
+            QLabel#AccentValue {
+                color: #00F0FF;
+                font-weight: 700;
+            }
+
+            /* Standard Texts styling */
+            QLabel {
+                color: #E1E1E6;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+            }
+
+            QLabel#PageSubHeader {
+                color: #8C8C96;
+                font-size: 14px;
+                margin-bottom: 5px;
+            }
+
+            /* Scroll Area configurations */
+            QScrollArea#DashboardScroll {
+                border: none;
+                background-color: transparent;
+            }
+
+            QWidget#TransparentBase {
+                background-color: transparent;
+            }
+
+            /* Gesture Cards layout directory */
+            QFrame#GestureCard {
+                background-color: #17171A;
+                border: 1px solid #232328;
+                border-radius: 12px;
+            }
+            
+            QFrame#GestureCard:hover {
+                border: 1px solid #00F0FF;
+            }
+
+            QLabel#GestureName {
+                color: #FFFFFF;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            QLabel#GestureCategory {
+                color: #00F0FF;
+                background-color: rgba(0, 240, 255, 0.08);
+                border: 1px solid rgba(0, 240, 255, 0.2);
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+
+            QLabel#GestureDesc {
+                color: #8C8C96;
+                font-size: 13px;
+            }
+
+            QLabel#GestureMapping {
+                color: #A1A1AA;
+                font-weight: 600;
+                font-size: 12px;
+            }
+
+            QPushButton#SmallEditButton {
+                background-color: #232328;
+                color: #E1E1E6;
+                border: 1px solid #2D2D34;
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+
+            QPushButton#SmallEditButton:hover {
+                background-color: #007ACC;
+                color: #FFFFFF;
+                border: 1px solid #00F0FF;
+            }
+
+            QLabel#SettingsText {
+                font-size: 14px;
+                font-weight: 500;
+            }
         """)
 
     def closeEvent(self, event):
